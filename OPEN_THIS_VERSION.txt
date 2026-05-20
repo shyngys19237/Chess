@@ -1,0 +1,6 @@
+FINAL UPDATED VERSION
+Changes included:
+1. Removed the left phone-like 'Play a bot, then learn...' block.
+2. Pre-game setup is now a clean Chess.com-style selection screen.
+3. Post-game AI Coach report now includes accuracy, opponent accuracy, summary, move-quality stats, and what to improve next.
+4. package-lock.json was intentionally removed so npm uses your local public registry.

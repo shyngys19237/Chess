@@ -1,0 +1,497 @@
+-- MateMind v2 schema
+-- Run this in the Supabase SQL editor after creating a project.
+-- It provisions auth profiles, game history, reviews, virtual coins,
+-- cosmetic piece skins, optional multiplayer room metadata, and avatar storage.
+
+create extension if not exists pgcrypto;
+
+-- ------------------------------------------------------------
+-- Profiles
+-- ------------------------------------------------------------
+create table if not exists public.profiles (
+  id uuid references auth.users on delete cascade primary key,
+  username text unique not null,
+  city text not null default 'Other',
+  avatar_url text,
+  coins integer not null default 1000 check (coins >= 0),
+  active_skin text not null default 'classic',
+  xp integer not null default 0,
+  games_played integer not null default 0,
+  wins integer not null default 0,
+  losses integer not null default 0,
+  draws integer not null default 0,
+  reviews_completed integer not null default 0,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table public.profiles enable row level security;
+
+alter table public.profiles add column if not exists avatar_url text;
+alter table public.profiles add column if not exists coins integer not null default 1000;
+alter table public.profiles add column if not exists active_skin text not null default 'classic';
+
+alter table public.profiles drop constraint if exists profiles_coins_check;
+alter table public.profiles add constraint profiles_coins_check check (coins >= 0);
+
+drop policy if exists "Profiles are publicly readable" on public.profiles;
+create policy "Profiles are publicly readable"
+  on public.profiles for select
+  using (true);
+
+drop policy if exists "Users can insert own profile" on public.profiles;
+create policy "Users can insert own profile"
+  on public.profiles for insert
+  with check (auth.uid() = id);
+
+drop policy if exists "Users can update own profile" on public.profiles;
+create policy "Users can update own profile"
+  on public.profiles for update
+  using (auth.uid() = id)
+  with check (auth.uid() = id);
+
+-- ------------------------------------------------------------
+-- Store catalog / ownership
+-- ------------------------------------------------------------
+create table if not exists public.store_skins (
+  id text primary key,
+  name text not null,
+  description text not null,
+  price integer not null check (price >= 0),
+  rarity text not null,
+  is_active boolean not null default true,
+  created_at timestamp with time zone not null default now()
+);
+
+insert into public.store_skins (id, name, description, price, rarity, is_active)
+values
+  ('classic', 'Classic', 'Clean tournament-style pieces for every board.', 0, 'Starter', true),
+  ('emerald', 'Emerald', 'Green-tinted crowned pieces that match MateMind''s primary UI.', 220, 'Common', true),
+  ('midnight', 'Midnight', 'High-contrast pieces with a neon shadow for dark rooms.', 420, 'Rare', true),
+  ('gold', 'Gold Crown', 'Warm premium pieces with a celebratory champion edge.', 720, 'Epic', true),
+  ('pixel', 'Pixel Arcade', 'Blocky retro glyph treatment for casual bot grinding.', 360, 'Rare', true),
+  ('marble', 'Marble', 'Soft stone-toned pieces designed for slower review sessions.', 520, 'Rare', true)
+on conflict (id) do update set
+  name = excluded.name,
+  description = excluded.description,
+  price = excluded.price,
+  rarity = excluded.rarity,
+  is_active = excluded.is_active;
+
+alter table public.store_skins enable row level security;
+
+drop policy if exists "Store skins are publicly readable" on public.store_skins;
+create policy "Store skins are publicly readable"
+  on public.store_skins for select
+  using (true);
+
+create table if not exists public.owned_skins (
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  skin_id text references public.store_skins(id) on delete cascade not null,
+  purchased_at timestamp with time zone not null default now(),
+  primary key (user_id, skin_id)
+);
+
+alter table public.owned_skins enable row level security;
+
+create or replace function public.handle_new_user()
+returns trigger as $$
+begin
+  insert into public.profiles (id, username, city)
+  values (
+    new.id,
+    coalesce(nullif(new.raw_user_meta_data->>'username', ''), split_part(coalesce(new.email, 'player@example.com'), '@', 1), 'player'),
+    coalesce(nullif(new.raw_user_meta_data->>'city', ''), 'Other')
+  )
+  on conflict (id) do nothing;
+
+  insert into public.owned_skins (user_id, skin_id)
+  values (new.id, 'classic')
+  on conflict do nothing;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+
+drop policy if exists "Users can read own skins" on public.owned_skins;
+create policy "Users can read own skins"
+  on public.owned_skins for select
+  using (auth.uid() = user_id);
+
+create table if not exists public.wallet_transactions (
+  id bigint generated by default as identity primary key,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  reason text not null,
+  amount integer not null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now()
+);
+
+alter table public.wallet_transactions enable row level security;
+
+drop policy if exists "Users can read own wallet transactions" on public.wallet_transactions;
+create policy "Users can read own wallet transactions"
+  on public.wallet_transactions for select
+  using (auth.uid() = user_id);
+
+-- inserts are performed through purchase_skin() only.
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+create or replace function public.purchase_skin(target_skin_id text)
+returns jsonb as $$
+declare
+  current_profile public.profiles%rowtype;
+  skin_price integer;
+  next_skin_list jsonb;
+begin
+  select * into current_profile from public.profiles where id = auth.uid();
+  if current_profile.id is null then
+    raise exception 'Sign in before purchasing cosmetics.';
+  end if;
+
+  select price into skin_price
+  from public.store_skins
+  where id = target_skin_id and is_active = true;
+
+  if skin_price is null then
+    raise exception 'Unknown skin.';
+  end if;
+
+  if exists (
+    select 1 from public.owned_skins where user_id = auth.uid() and skin_id = target_skin_id
+  ) then
+    raise exception 'You already own this skin.';
+  end if;
+
+  if current_profile.coins < skin_price then
+    raise exception 'Not enough coins.';
+  end if;
+
+  update public.profiles
+  set coins = coins - skin_price, updated_at = now()
+  where id = auth.uid();
+
+  insert into public.owned_skins (user_id, skin_id)
+  values (auth.uid(), target_skin_id);
+
+  insert into public.wallet_transactions (user_id, reason, amount, metadata)
+  values (auth.uid(), 'skin_purchase', -skin_price, jsonb_build_object('skin_id', target_skin_id));
+
+  select jsonb_agg(skin_id order by purchased_at asc) into next_skin_list
+  from public.owned_skins
+  where user_id = auth.uid();
+
+  return jsonb_build_object(
+    'coins', (select coins from public.profiles where id = auth.uid()),
+    'activeSkin', (select active_skin from public.profiles where id = auth.uid()),
+    'ownedSkins', coalesce(next_skin_list, '[]'::jsonb)
+  );
+end;
+$$ language plpgsql security definer set search_path = public;
+
+grant execute on function public.purchase_skin(text) to authenticated;
+
+-- ------------------------------------------------------------
+-- Games
+-- ------------------------------------------------------------
+create table if not exists public.games (
+  id text primary key,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  mode text not null check (mode in ('ai', 'local', 'room')),
+  player_color text not null check (player_color in ('w', 'b', 'both')),
+  result text not null check (result in ('1-0', '0-1', '1/2-1/2', '*')),
+  result_cause text,
+  pgn text not null default '',
+  final_fen text not null,
+  moves_count integer not null default 0,
+  opponent text,
+  room_id text,
+  difficulty text,
+  coin_mode text not null default 'free' check (coin_mode in ('free', 'stake')),
+  stake_coins integer not null default 0 check (stake_coins >= 0),
+  payout_multiplier numeric not null default 1 check (payout_multiplier >= 1),
+  coin_delta integer not null default 0,
+  wager_settled boolean not null default false,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table public.games add column if not exists difficulty text;
+alter table public.games add column if not exists coin_mode text not null default 'free';
+alter table public.games add column if not exists stake_coins integer not null default 0;
+alter table public.games add column if not exists payout_multiplier numeric not null default 1;
+alter table public.games add column if not exists coin_delta integer not null default 0;
+alter table public.games add column if not exists wager_settled boolean not null default false;
+
+alter table public.games enable row level security;
+
+drop policy if exists "Users can read own games" on public.games;
+create policy "Users can read own games"
+  on public.games for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users can insert own games" on public.games;
+create policy "Users can insert own games"
+  on public.games for insert
+  with check (auth.uid() = user_id);
+
+drop policy if exists "Users can update own games" on public.games;
+create policy "Users can update own games"
+  on public.games for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+drop policy if exists "Users can delete own games" on public.games;
+create policy "Users can delete own games"
+  on public.games for delete
+  using (auth.uid() = user_id);
+
+create or replace function public.update_profile_after_game()
+returns trigger as $$
+declare
+  xp_gain integer := 0;
+  did_win integer := 0;
+  did_lose integer := 0;
+  did_draw integer := 0;
+  player_won boolean := false;
+  wager_delta integer := 0;
+begin
+  if new.result = '1/2-1/2' then
+    xp_gain := 10;
+    did_draw := 1;
+  elsif new.result = '1-0' and new.player_color = 'w' then
+    xp_gain := 25;
+    did_win := 1;
+    player_won := true;
+  elsif new.result = '0-1' and new.player_color = 'b' then
+    xp_gain := 25;
+    did_win := 1;
+    player_won := true;
+  elsif new.result = '0-1' and new.player_color = 'w' then
+    xp_gain := 5;
+    did_lose := 1;
+  elsif new.result = '1-0' and new.player_color = 'b' then
+    xp_gain := 5;
+    did_lose := 1;
+  elsif new.result in ('1-0', '0-1') then
+    xp_gain := 5;
+  end if;
+
+  if new.mode = 'ai' and new.coin_mode = 'stake' and new.stake_coins > 0 then
+    if new.result = '1/2-1/2' then
+      wager_delta := 0;
+    elsif player_won then
+      wager_delta := round(new.stake_coins * (new.payout_multiplier - 1))::integer;
+    else
+      wager_delta := -new.stake_coins;
+    end if;
+
+    update public.games
+    set coin_delta = wager_delta, wager_settled = true, updated_at = now()
+    where id = new.id;
+
+    update public.profiles
+    set coins = greatest(0, coins + wager_delta), updated_at = now()
+    where id = new.user_id;
+
+    insert into public.wallet_transactions (user_id, reason, amount, metadata)
+    values (
+      new.user_id,
+      'bot_wager_settlement',
+      wager_delta,
+      jsonb_build_object('game_id', new.id, 'stake', new.stake_coins, 'multiplier', new.payout_multiplier)
+    );
+  end if;
+
+  update public.profiles
+  set
+    xp = xp + xp_gain,
+    games_played = games_played + 1,
+    wins = wins + did_win,
+    losses = losses + did_lose,
+    draws = draws + did_draw,
+    updated_at = now()
+  where id = new.user_id;
+
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+drop trigger if exists on_game_saved on public.games;
+create trigger on_game_saved
+  after insert on public.games
+  for each row execute function public.update_profile_after_game();
+
+-- ------------------------------------------------------------
+-- Game reviews
+-- ------------------------------------------------------------
+create table if not exists public.game_reviews (
+  game_id text primary key references public.games(id) on delete cascade,
+  user_id uuid references public.profiles(id) on delete cascade not null,
+  white_accuracy integer not null check (white_accuracy between 0 and 100),
+  black_accuracy integer not null check (black_accuracy between 0 and 100),
+  review_json jsonb not null,
+  generated_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table public.game_reviews enable row level security;
+
+drop policy if exists "Users can read own game reviews" on public.game_reviews;
+create policy "Users can read own game reviews"
+  on public.game_reviews for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users can insert own game reviews" on public.game_reviews;
+create policy "Users can insert own game reviews"
+  on public.game_reviews for insert
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1
+      from public.games game_row
+      where game_row.id = game_id
+        and game_row.user_id = auth.uid()
+    )
+  );
+
+drop policy if exists "Users can update own game reviews" on public.game_reviews;
+create policy "Users can update own game reviews"
+  on public.game_reviews for update
+  using (auth.uid() = user_id)
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1
+      from public.games game_row
+      where game_row.id = game_id
+        and game_row.user_id = auth.uid()
+    )
+  );
+
+drop policy if exists "Users can delete own game reviews" on public.game_reviews;
+create policy "Users can delete own game reviews"
+  on public.game_reviews for delete
+  using (auth.uid() = user_id);
+
+create or replace function public.update_profile_after_review()
+returns trigger as $$
+begin
+  update public.profiles
+  set
+    reviews_completed = reviews_completed + 1,
+    xp = xp + 5,
+    updated_at = now()
+  where id = new.user_id;
+  return new;
+end;
+$$ language plpgsql security definer set search_path = public;
+
+drop trigger if exists on_review_created on public.game_reviews;
+create trigger on_review_created
+  after insert on public.game_reviews
+  for each row execute function public.update_profile_after_review();
+
+-- ------------------------------------------------------------
+-- Optional room metadata (Realtime Broadcast still handles live moves)
+-- ------------------------------------------------------------
+create table if not exists public.multiplayer_rooms (
+  id text primary key,
+  created_by uuid references public.profiles(id) on delete cascade not null,
+  status text not null default 'waiting' check (status in ('waiting', 'playing', 'finished')),
+  white_player_id uuid references public.profiles(id) on delete set null,
+  black_player_id uuid references public.profiles(id) on delete set null,
+  pgn text not null default '',
+  current_fen text not null default 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+  last_move jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
+alter table public.multiplayer_rooms enable row level security;
+
+drop policy if exists "Room participants can read rooms" on public.multiplayer_rooms;
+create policy "Room participants can read rooms"
+  on public.multiplayer_rooms for select
+  using (
+    auth.uid() = created_by
+    or auth.uid() = white_player_id
+    or auth.uid() = black_player_id
+  );
+
+drop policy if exists "Authenticated users can create own rooms" on public.multiplayer_rooms;
+create policy "Authenticated users can create own rooms"
+  on public.multiplayer_rooms for insert
+  with check (auth.uid() = created_by);
+
+drop policy if exists "Room participants can update rooms" on public.multiplayer_rooms;
+create policy "Room participants can update rooms"
+  on public.multiplayer_rooms for update
+  using (
+    auth.uid() = created_by
+    or auth.uid() = white_player_id
+    or auth.uid() = black_player_id
+  )
+  with check (
+    auth.uid() = created_by
+    or auth.uid() = white_player_id
+    or auth.uid() = black_player_id
+  );
+
+-- ------------------------------------------------------------
+-- Avatar Storage
+-- ------------------------------------------------------------
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do update set public = true;
+
+drop policy if exists "Avatar images are publicly readable" on storage.objects;
+create policy "Avatar images are publicly readable"
+  on storage.objects for select
+  using (bucket_id = 'avatars');
+
+drop policy if exists "Users can upload own avatar folder" on storage.objects;
+create policy "Users can upload own avatar folder"
+  on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'avatars'
+    and auth.uid()::text = split_part(name, '/', 1)
+  );
+
+drop policy if exists "Users can update own avatar folder" on storage.objects;
+create policy "Users can update own avatar folder"
+  on storage.objects for update to authenticated
+  using (
+    bucket_id = 'avatars'
+    and auth.uid()::text = split_part(name, '/', 1)
+  )
+  with check (
+    bucket_id = 'avatars'
+    and auth.uid()::text = split_part(name, '/', 1)
+  );
+
+-- ------------------------------------------------------------
+-- Leaderboard view
+-- ------------------------------------------------------------
+create or replace view public.leaderboard as
+select
+  row_number() over (order by xp desc, wins desc, games_played desc, username asc)::integer as rank,
+  id::text as id,
+  username,
+  city,
+  avatar_url,
+  xp,
+  coins,
+  games_played,
+  wins,
+  losses,
+  draws,
+  reviews_completed
+from public.profiles
+order by xp desc, wins desc, games_played desc, username asc;
+
+grant select on public.leaderboard to anon, authenticated;
