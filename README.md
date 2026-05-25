@@ -2,14 +2,12 @@
 
 ## Live Demo
 
-https://free-pumas-sniff.loca.lt
+https://chess-x15f.vercel.app
 
-> Note: the live demo is currently hosted through LocalTunnel for the submission deadline.  
-> The link works while the local development server is running.
 
 ## GitHub Repository
 
-https://github.com/shyngys19237/Chess
+https://chess-x15f.vercel.app
 
 ## Product Description
 
@@ -87,5 +85,5 @@ npm run build
 
 ## Submission Links
 
-Live Project: https://free-pumas-sniff.loca.lt  
+Live Project: https://chess-x15f.vercel.app
 GitHub Repository: https://github.com/shyngys19237/Chess
